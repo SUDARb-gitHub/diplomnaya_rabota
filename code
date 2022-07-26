@@ -1,0 +1,770 @@
+#include <iostream>
+#include <stdio.h>
+#include <math.h>
+#include <chrono>
+#include <fstream>
+
+#define PI 3.141592653589793
+#define DOUBLE_MAX 1.7976931348623157E+308
+#define blocks 16380
+#define blockSize 512
+#define EPS 1E-12
+
+#define FREE_PATH 2.03646753
+
+#define CUDA_CHECK_ERROR(err)           \
+if ((err) != cudaSuccess) {          \
+    printf("Cuda error: %s\n", cudaGetErrorString(err));    \
+    printf("Error in file: %s, line: %i\n", __FILE__, __LINE__);  \
+}
+
+using namespace std;
+
+class Timer
+{
+private:
+    // Псевдонимы типов используются для удобного доступа к вложенным типам
+    using clock_t = std::chrono::high_resolution_clock;
+    using second_t = std::chrono::duration<double, std::ratio<1> >;
+
+    std::chrono::time_point<clock_t> m_beg;
+
+public:
+    Timer() : m_beg(clock_t::now())
+    {
+    }
+
+    void reset()
+    {
+        m_beg = clock_t::now();
+    }
+
+    double elapsed() const
+    {
+        return std::chrono::duration_cast<second_t>(clock_t::now() - m_beg).count();
+    }
+};
+
+__device__ double search_D_t(double x1, double y1, double x2, double y2, double vx1, double vy1, double vx2, double vy2, double R) {
+    double A, B, C, D;
+    double t1, t2;
+
+    A = (vx1 - vx2)*(vx1 - vx2) + (vy1 - vy2)*(vy1 - vy2);
+    B = 2*((x1-x2)*(vx1 - vx2) + (y1-y2)*(vy1 - vy2));
+    C = (x1-x2)*(x1-x2) + (y1-y2)*(y1-y2) - 4*R*R;
+    D = B*B - 4*A*C;
+
+    if (D < 0)  {return DOUBLE_MAX;}
+
+    //if (sqrt((x1-x2)*(x1-x2) + (y1-y2)*(y1-y2)) < 2) {return DOUBLE_MAX;}
+
+    t1 = (-B - (double)sqrt(D)) / 2 / A;
+    t2 = (-B + (double)sqrt(D)) / 2 / A;
+
+    if (abs(t1) < EPS) {
+        t1 = 0;
+    }
+    if (abs(t2) < EPS) {
+        t2 = 0;
+    }
+
+    if (t1 < 0 && t2 > 0)               {return t2;}
+    if (t1 > 0 && t2 < 0)               {return t1;}
+    if (t1 > 0 && t2 > 0 && t1 < t2)    {return t1;}
+    if (t1 > 0 && t2 > 0 && t2 < t1)    {return t2;}
+    return DOUBLE_MAX;
+    }
+
+__device__ double search_r(double x1, double y1, double x2, double y2) {
+    return sqrt((x1-x2)*(x1-x2)+(y1-y2)*(y1-y2));
+}
+__global__ void kernel_pwa(double *x, double *y, double *vx, double *vy, int *m, int *l, double *tmin0, double limit, double R) {
+    // periodic walls all
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    double t;
+    // сталкиваем две частицы в одной нити
+    int mm, ll;
+    mm = m[index];
+    ll = l[index];
+
+    // cчитается с клонами
+    // 3 области, клонируем одну частицу в паре
+    for(int i = 0; i < 5; i++) {
+        // сделай if сначала проверь case 0, если D<0, то остальные
+        switch(i) {
+            case 0: t = search_D_t(x[mm], y[mm], x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+            case 1: t = search_D_t(x[mm]-2*limit, y[mm], x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+            case 2: t = search_D_t(x[mm]+2*limit, y[mm], x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+            case 3: t = search_D_t(x[mm], y[mm]+2*limit, x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+            case 4: t = search_D_t(x[mm], y[mm]-2*limit, x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+            //case 5: t = search_D_t(x[mm]-2*limit, y[mm]+2*limit, x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+            //case 6: t = search_D_t(x[mm]+2*limit, y[mm]+2*limit, x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+            //case 7: t = search_D_t(x[mm]-2*limit, y[mm]-2*limit, x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+            //case 8: t = search_D_t(x[mm]+2*limit, y[mm]-2*limit, x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+
+        }
+        if (t != DOUBLE_MAX) { // столкнуться в одном случае
+            break;
+        }
+    }
+    tmin0[index] = t;
+    __syncthreads();
+}
+__global__ void kernel_pwv(double *x, double *y, double *vx, double *vy, int *m, int *l, double *tmin0, double limit, double R) {
+    // periodic walls vertical
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    double t;
+    // сталкиваем две частицы в одной нити
+    int mm, ll;
+    mm = m[index];
+    ll = l[index];
+
+    // cчитается с клонами
+    // 3 области, клонируем одну частицу в паре
+    for(int i = 0; i < 3; i++) {
+        // сделай if сначала проверь case 0, если D<0, то остальные
+        switch(i) {
+            case 0: t = search_D_t(x[mm], y[mm], x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+            case 1: t = search_D_t(x[mm]-2*limit, y[mm], x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+            case 2: t = search_D_t(x[mm]+2*limit, y[mm], x[ll], y[ll], vx[mm], vy[mm], vx[ll], vy[ll],R); break;
+        }
+        if (t != DOUBLE_MAX) { // столкнуться в одном случае
+            break;
+        }
+    }
+    tmin0[index] = t;
+    __syncthreads();
+}
+
+__global__ void kernel_hwh(int R, double *y, double *vy, double *time, double limit) {
+    // hard walls horizontal
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (limit - abs(y[index]) > 10*FREE_PATH) { // скипаем расчет до стенки дальних от нее частиц
+        time[index] = DOUBLE_MAX;
+    } else {
+        time[index] = ( limit - R - y[index] * vy[index] / abs(vy[index]) ) / abs(vy[index]);
+    }
+    __syncthreads();
+}
+
+__device__ double atomicMin_double(double* address, double val)
+{
+    unsigned long long int* address_as_ull = (unsigned long long int*) address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(fmin(val, __longlong_as_double(assumed))));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+
+__global__ void cuda_minimum(double* in, unsigned int size, double* out)
+{
+    __shared__ double buf [blockSize];
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < size)
+        buf[threadIdx.x] = in[index];
+    else
+        buf[threadIdx.x] = in[0];
+    index += blocks * blockSize;
+    while (index < size) {
+        buf[threadIdx.x] = fmin(buf[threadIdx.x], in[index]);
+        index += blocks * blockSize;
+    }
+    __syncthreads();
+
+    for (int s = blockSize / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            buf[threadIdx.x] = min(buf[threadIdx.x], buf[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicMin_double(out, buf[0]);
+    }
+    __syncthreads();
+}
+
+__global__ void search_min_index(double *times, double min_t, int *min_index) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (times[index] == min_t) {
+        min_index[0] = index;
+    }
+}
+
+__global__ void dXdY_limit(double *x, double *y, double *vx, double *vy, double time, double lim) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    x[index] = x[index] + vx[index]*time; // текущие координаты (мб вне области)
+    y[index] = y[index] + vy[index]*time;
+
+    if(x[index] < -lim)
+    {x[index]=x[index]+2*lim;}
+    if(x[index] > lim)
+    {x[index]=x[index]-2*lim;}
+
+    if(y[index] < -lim)
+    {y[index]=y[index]+2*lim;}
+    if(x[index] > lim)
+    {y[index]=y[index]-2*lim;}
+    __syncthreads();
+}
+
+__device__ void dVX_dVY(double *x, double *y, double *vx, double *vy, int p1, int p2, double R) {
+    double vx1_, vx2_, vy1_, vy2_;
+
+    double cosa = (x[p2]-x[p1])/2/R;
+    double sina = (y[p2]-y[p1])/2/R;
+
+
+    if (cosa > 1) {
+        printf("cosa > 1!!!!!\n");
+    }
+
+//  Повернем систему координат по линии, соединяющей центры шаров (новая система K')
+    vx1_ = vx[p1]*cosa+vy[p1]*sina;
+    vy1_ = -vx[p1]*sina+vy[p1]*cosa;
+
+    vx2_ = vx[p2]*cosa+vy[p2]*sina;
+    vy2_ = -vx[p2]*sina+vy[p2]*cosa;
+
+//  Заменим в векторах системы K' составляющую vx_
+//  Обратно перейдем в старую систему К поворотом
+
+    vx[p1] = vx2_*cosa-vy1_*sina; // vx1
+    vy[p1] = vx2_*sina+vy1_*cosa; // vy1
+
+    vx[p2] = vx1_*cosa-vy2_*sina; // vx2
+    vy[p2] = vx1_*sina+vy2_*cosa; // vy2
+}
+
+__host__ double search_V(double vx, double vy) {
+    return sqrt(vx*vx + vy*vy);
+}
+
+__global__ void dist_impulses_pwv(double *x, double *y, double *vx, double *vy, int *min_i, int *m, int *l, double lim, double R) {
+    // periodic walls vertical
+    double cor_r;
+    int min;
+    int sample = 0;
+
+    min = min_i[0];
+
+    for (int k = 0; k < 3; k++) {
+
+        switch(k) {
+            case 0: cor_r = search_r(x[m[min]], y[m[min]], x[l[min]], y[l[min]]); break;
+            case 1: cor_r = search_r(x[m[min]] - 2*lim, y[m[min]], x[l[min]], y[l[min]]); break;
+            case 2: cor_r = search_r(x[m[min]] + 2*lim, y[m[min]], x[l[min]], y[l[min]]); break;
+        }
+        if (abs(cor_r - 2*R) < EPS) {
+            sample = k;
+            break;
+        }
+    }
+
+    switch(sample) {
+        case 0: break;
+        case 1: x[m[min]] = x[m[min]] - 2*lim; break;
+        case 2: x[m[min]] = x[m[min]] + 2*lim; break;
+    }
+
+//      Распределим импульсы
+    dVX_dVY(x, y, vx, vy, m[min], l[min], R);
+
+//      Возвращаем координаты обратно
+    switch(sample) {
+        case 0: break;
+        case 1: x[m[min]] = x[m[min]] + 2*lim; break;
+        case 2: x[m[min]] = x[m[min]] - 2*lim; break;
+    }
+}
+
+__global__ void dist_impulses_pwa(double *x, double *y, double *vx, double *vy, int *min_i, int *m, int *l, double lim, double R) {
+    // periodic walls all
+    double cor_r;
+    int min;
+    int sample = 0;
+
+    min = min_i[0];
+
+    for (int k = 0; k < 5; k++) {
+
+        switch(k) {
+            case 0: cor_r = search_r(x[m[min]], y[m[min]], x[l[min]], y[l[min]]); break;
+            case 1: cor_r = search_r(x[m[min]] - 2*lim, y[m[min]], x[l[min]], y[l[min]]); break;
+            case 2: cor_r = search_r(x[m[min]] + 2*lim, y[m[min]], x[l[min]], y[l[min]]); break;
+            case 3: cor_r = search_r(x[m[min]], y[m[min]] + 2*lim, x[l[min]], y[l[min]]); break;
+            case 4: cor_r = search_r(x[m[min]], y[m[min]] - 2*lim, x[l[min]], y[l[min]]); break;
+            //case 5: cor_r = search_r(x[m[min]] - 2*lim, y[m[min]] + 2*lim, x[l[min]], y[l[min]]); break;
+            //case 6: cor_r = search_r(x[m[min]] + 2*lim, y[m[min]] + 2*lim, x[l[min]], y[l[min]]); break;
+            //case 7: cor_r = search_r(x[m[min]] - 2*lim, y[m[min]] - 2*lim, x[l[min]], y[l[min]]); break;
+            //case 8: cor_r = search_r(x[m[min]] + 2*lim, y[m[min]] - 2*lim, x[l[min]], y[l[min]]); break;
+        }
+        if (abs(cor_r - 2*R) < EPS) {
+            sample = k;
+            break;
+        }
+    }
+
+    switch(sample) {
+        case 0: break;
+        case 1: x[m[min]] = x[m[min]] - 2*lim; break;
+        case 2: x[m[min]] = x[m[min]] + 2*lim; break;
+        case 3: y[m[min]] = y[m[min]] + 2*lim; break;
+        case 4: y[m[min]] = y[m[min]] - 2*lim; break;
+        //case 5: x[m[min]] = x[m[min]] - 2*lim; y[m[min]] = y[m[min]] + 2*lim; break;
+        //case 6: x[m[min]] = x[m[min]] + 2*lim; y[m[min]] = y[m[min]] + 2*lim; break;
+        //case 7: x[m[min]] = x[m[min]] - 2*lim; y[m[min]] = y[m[min]] - 2*lim; break;
+        //case 8: x[m[min]] = x[m[min]] + 2*lim; y[m[min]] = y[m[min]] - 2*lim; break;
+    }
+
+//      Распределим импульсы
+    dVX_dVY(x, y, vx, vy, m[min], l[min], R);
+
+//      Возвращаем координаты обратно
+    switch(sample) {
+        case 0: break;
+        case 1: x[m[min]] = x[m[min]] + 2*lim; break;
+        case 2: x[m[min]] = x[m[min]] - 2*lim; break;
+        case 3: y[m[min]] = y[m[min]] - 2*lim; break;
+        case 4: y[m[min]] = y[m[min]] + 2*lim; break;
+        //case 5: x[m[min]] = x[m[min]] + 2*lim; y[m[min]] = y[m[min]] - 2*lim; break;
+        //case 6: x[m[min]] = x[m[min]] - 2*lim; y[m[min]] = y[m[min]] - 2*lim; break;
+        //case 7: x[m[min]] = x[m[min]] + 2*lim; y[m[min]] = y[m[min]] + 2*lim; break;
+        //case 8: x[m[min]] = x[m[min]] - 2*lim; y[m[min]] = y[m[min]] + 2*lim; break;
+    }
+}
+
+__global__ void dist_impulses_hwh(double *x, double *y, double *vx, double *vy, int *min_i) {
+    // walls horizontal
+    int min = min_i[0]; // min - номер нити с парой сейчас сталкивающихся частиц
+    vy[min] = -vy[min];
+    //printf("%i:\tx=%f\ty=%f\tvx=%f\tvy=%f\n", min , x[min], y[min], vx[min], vy[min]);
+}
+
+__host__ void init_threads (int N, int threads, int *m, int *l) {
+    //  Создадим два массива с количеством элементов threads, каждый элемент которого содержит номер частицы
+    //  Т.о. каждой ните будет дана свой пара частиц, которые будут просчитываться на столкновение
+    //  Нить 0: 0-1, нить 1: 0-2, ...
+    int k, step;
+    k = 0;
+    step = N - 1;
+    for (int i = 0; i < threads; i++) {
+        if (step == 0) {
+            k++;
+            step = N - 1 - k;
+        }
+        m[i] = k;
+        l[i] = N - step;
+        step--;
+    }
+}
+
+__host__ bool readFile(double *array, string filename, int N) {
+    setlocale(LC_ALL, "rus");
+    ifstream file (filename);
+
+    if(!file) {
+        return 0;
+    } else {
+        for (int i = 0; i < N; i++) {
+            file >> array[i];
+        }
+        return 1;
+    }
+}
+
+int main() {
+    printf("\n//---------------!OPTI_Closed_flow!---------------//\n\n");
+
+    int preset = 1; // 0 - труба и два потока, 1 - 4 стенки с периодическими условиями и случайные скорости
+    int N = 4096; // количество частиц
+    double R = 1; // радиус частицы (ПЛАНКОВСКИХ МЕТРОВ)
+    double vmod0 = 100; // начальный модуль скорости (ПЛАНКОВСКИХ ДЛИН В ПЛАНКОВСКУЮ СЕКУНДУ)
+    int boost = 1000; // для создания двух потоков (ПЛАНКОВСКИХ ДЛИН В ПЛАНКОВСКУЮ СЕКУНДУ)
+    int cells = 4096; // корень должен давать целое
+    double cell_size = 2.4; // размер клетки для инициализации частиц (ПЛАНКОВСКИХ ДЛИН)
+    int seed = 900;
+
+    if (2*R>cell_size) {
+        printf("Частица не влезает в ячейку\n");
+        return 0;
+    }
+
+    srand(seed);
+    string file_x("//home//npacuk//FINAL//x.txt"); // пути к файлам с координатами и скоростями
+    string file_y("//home//npacuk//FINAL//y.txt");
+    string file_vx("//home//npacuk//FINAL//vx.txt");
+    string file_vy("//home//npacuk//FINAL//vy.txt");
+
+    Timer t;
+
+    switch(preset) {
+        case 0:
+            printf("\nДве горизонтальных твердых стенки");
+            printf("\nДве вертикальных периодических стенки");
+            printf("\nДва противоположных потока\n\n");
+            break;
+        case 1:
+            printf("\n4 периодических стенки");
+            printf("\nСлучайная ориентация векторов скорости\n");
+            break;
+    }
+
+    bool flag; // выбор: новый запуск/продолжение
+    printf("%i частиц\n\n", N);
+    printf("Новый запуск? (yes-0 / no-1)? ");
+    scanf("%i", &flag);
+    printf("\n");
+
+    int iter;
+    printf("Введите количество итераций кода iter: ");
+    scanf("%i", &iter);
+    printf("\n");
+
+    int coll[iter];
+    bool flag1;
+    printf("Указать одно значение столкновений для всех итераций - 0\n");
+    printf("Указать разные количества столкновений за итерации - 1\n");
+    flag1 = 0;
+    scanf("%i", &flag1);
+    if (flag1 == 0) {
+        printf("Укажите одно количество столкновений для всех итераций: ");
+        scanf("%i", &coll[0]);
+        for (int i = 1; i < iter; i++) {
+            coll[i] = coll[0];
+        }
+    } else {
+        printf("Введите количества соударений на каждую итерацию кода colli: \n");
+        for (int i = 0; i < iter; i++) {
+            printf("iter %i/%i:", i+1, iter);
+            scanf("%i", &coll[i]);
+            printf("\n");
+        }
+    }
+
+    double *x, *y, *vx, *vy;
+    double sumE0, sumE1; // для контроля сохранения энергии
+    double system_time;
+    double *out;
+
+    int *m;
+    int *l;
+    double border;
+    int threads;
+    double tmin, tmin2;
+
+    double *dev_x, *dev_y, *dev_vx, *dev_vy;
+    double *dev_tmin0, *dev_tmin02, *dev_out, *dev_out2;
+    int *dev_min_index, *dev_min_index2, *dev_m, *dev_l;
+
+    threads = (N * N - N) / 2; // количество нитей
+
+//  Размер необходимой памяти
+    double dSIZE = threads * sizeof(double);
+    int iSIZE = threads * sizeof(int);
+
+//  Выделяем память на карте
+    cudaMalloc((void **) &dev_x, dSIZE); // Выделяем память на карте
+    cudaMalloc((void **) &dev_y, dSIZE);
+    cudaMalloc((void **) &dev_vx, dSIZE);
+    cudaMalloc((void **) &dev_vy, dSIZE);
+    cudaMalloc((void **) &dev_m, iSIZE);
+    cudaMalloc((void **) &dev_l, iSIZE);
+    cudaMalloc((void **) &dev_tmin0, dSIZE);
+    cudaMalloc((void **) &dev_tmin02, dSIZE);
+    cudaMalloc((void **) &dev_out, dSIZE);
+    cudaMalloc((void **) &dev_out2, dSIZE);
+    cudaMalloc((void **) &dev_min_index, iSIZE);
+    cudaMalloc((void **) &dev_min_index2, iSIZE);
+
+//  Выделяем память на хосте
+    x = (double *) malloc(dSIZE);
+    y = (double *) malloc(dSIZE);
+    vx = (double *) malloc(dSIZE);
+    vy = (double *) malloc(dSIZE);
+    m = (int *) malloc(iSIZE);
+    l = (int *) malloc(iSIZE);
+    out = (double *) malloc(dSIZE);
+
+    init_threads(N, threads, m, l); // Создает пары частиц на каждую нить
+
+//  Задаем сетку
+    int a = sqrt(cells);
+    border = a*cell_size/2.;
+    sumE0 = 0;
+    sumE1 = 0;
+    int np = 0; // number particle
+//----------------------------------------------------------------------//
+    switch (flag) {
+        case 0:
+            for (int i = 0; i < a; i++) {
+                for(int k = 0; k < a; k++) {
+                    x[np] = - a*cell_size/2 + cell_size/2 + i*cell_size;
+                    y[np] = - a*cell_size/2 + cell_size/2 + k*cell_size;
+                    np++;
+                }
+            }
+
+            //  Случайно задаем проекции скоростей каждой частице так, чтобы модуль скорости каждой был равен vmod0
+            for (int i = 0; i < N; i++) {
+                vx[i] = ((vmod0 * (double) rand() / RAND_MAX) * 2) - vmod0;
+                if (rand() % 2 == 0) { // четное, значит "+"
+                    vy[i] = sqrt(vmod0 * vmod0 - vx[i] * vx[i]);
+                } else { // нечетное, значит "-"
+                    vy[i] = -(sqrt(vmod0 * vmod0 - vx[i] * vx[i]));
+                }
+            }
+
+            if (preset == 0) {
+                for (int i = 0; i < N; i++) {
+                    if (y[i] > 0) {
+                        vx[i] = vx[i] + boost;
+                    } else {
+                        vx[i] = vx[i] - boost;
+                    }
+                }
+            }
+            break;
+        case 1:
+            // Достаем координаты и скорости частиц из чекпоинта
+            if (readFile(x, file_x, N) == 1)        {printf("Координаты x считаны\t+\n");}
+            else                                    {printf("Ошибка:\tКоординаты x не считаны!!!\n"); return 0;}
+            if (readFile(y, file_y, N) == 1)        {printf("Координаты y считаны\t+\n");}
+            else                                    {printf("Ошибка:\tКоординаты y не считаны!!!\n"); return 0;}
+            if (readFile(vx, file_vx, N) == 1)      {printf("Скорости vx считаны\t+\n");}
+            else                                    {printf("Ошибка:\tСкорости x не считаны!!!\n"); return 0;}
+            if (readFile(vy, file_vy, N) == 1)      {printf("Скорости vy считаны\t+\n");}
+            else                                    {printf("Ошибка:\tСкорости x не считаны!!!\n\n"); return 0;}
+            break;
+    }
+
+    for (int i = 0; i < N; i++) {
+        sumE0 += vx[i]*vx[i] + vy[i]*vy[i];
+    }
+    sumE0 = sumE0/2.; // начальная энергия системы
+
+    //-----------------------------------------------------------------//
+
+    printf("Начальная энергия: %.16f\n", sumE0);
+
+    // если это первый прогон, то сохраним инфу
+    if (flag == 0) {
+        FILE* f0;
+        f0 = fopen("info.csv", "w");
+        fprintf(f0,"N,R,vmod0,boost,cell_size,cells,seed,threads,blocks,blockSize\n");
+        fprintf(f0,"%i,%f,%f,%i,%f,%i,%i,%i,%i,%i\n",N,R,vmod0,boost,cell_size,cells,seed,threads,blocks,blockSize);
+        fclose(f0);
+
+        FILE* f1;
+        f1 = fopen("log.csv", "w");
+        fprintf(f1,"x,y,vx,vy,V,coll,evol_time,prog_time\n");
+        for (int i = 0; i < N; i++) {
+            fprintf(f1,"%.16f,%.16f,%.16f,%.16f,%.16f", x[i], y[i], vx[i], vy[i], search_V(vx[i], vy[i]));
+            if (i == 0) {
+                fprintf(f1,",0,0,0");
+            } fprintf(f1,"\n");
+        } fclose(f1);
+    }
+
+    //----------------------------GOOOOOÖOOOO-------------------------------------//
+
+    t.reset();
+    CUDA_CHECK_ERROR(cudaMemcpy(dev_m, m, iSIZE, cudaMemcpyHostToDevice));
+    CUDA_CHECK_ERROR(cudaMemcpy(dev_l, l, iSIZE, cudaMemcpyHostToDevice));
+    CUDA_CHECK_ERROR(cudaMemcpy(dev_x, x, dSIZE, cudaMemcpyHostToDevice));
+    CUDA_CHECK_ERROR(cudaMemcpy(dev_y, y, dSIZE, cudaMemcpyHostToDevice));
+    CUDA_CHECK_ERROR(cudaMemcpy(dev_vx, vx, dSIZE, cudaMemcpyHostToDevice));
+    CUDA_CHECK_ERROR(cudaMemcpy(dev_vy, vy, dSIZE, cudaMemcpyHostToDevice));
+
+    FILE* f3;
+    switch(preset) {
+        case 0: for (int j = 0; j < iter; j++) {
+                system_time = 0; // время эволюции системы
+
+                for (int i = 0; i < coll[j]; i++) {
+
+                    out[0] = DOUBLE_MAX;
+                    // periodic walls y axis (vertical)
+                    kernel_pwv <<<threads/blockSize, blockSize>>>(dev_x, dev_y, dev_vx, dev_vy, dev_m, dev_l, dev_tmin0, border, R);
+//      Отберем из массива наименьшее время
+                    CUDA_CHECK_ERROR(cudaMemcpy(dev_out, out, dSIZE, cudaMemcpyHostToDevice));
+                    cuda_minimum <<<blocks, blockSize>>>(dev_tmin0, threads, dev_out);
+                    CUDA_CHECK_ERROR(cudaMemcpy(out, dev_out, dSIZE, cudaMemcpyDeviceToHost));
+                    tmin = out[0];
+
+                    // стенка
+                    out[0] = DOUBLE_MAX;
+                    kernel_hwh <<<N/blockSize, blockSize>>> (R, dev_y, dev_vy, dev_tmin02, border); // hard walls x axis (horizontal)
+                    //      Отберем из массива наименьшее время
+                    CUDA_CHECK_ERROR(cudaMemcpy(dev_out2, out, dSIZE, cudaMemcpyHostToDevice));
+                    cuda_minimum <<<blocks, blockSize>>>(dev_tmin02, N, dev_out2);
+                    CUDA_CHECK_ERROR(cudaMemcpy(out, dev_out2, dSIZE, cudaMemcpyDeviceToHost));
+                    tmin2 = out[0]; // со стенкой
+
+                    if (tmin < tmin2) {
+                        system_time += tmin; //прибавляем квант времени к общему времени эволюции системы
+                        search_min_index <<<blocks, blockSize>>> (dev_tmin0, tmin, dev_min_index);
+                        dXdY_limit <<<N/blockSize, blockSize>>>(dev_x, dev_y, dev_vx, dev_vy, tmin, border);
+                        dist_impulses_pwv <<<1,1>>> (dev_x, dev_y, dev_vx, dev_vy, dev_min_index, dev_m, dev_l, border, R);
+                    } else {
+                        system_time += tmin2; // добавляем квант времени к общему времени эволюции системы
+                        search_min_index <<<N/blockSize, blockSize>>> (dev_tmin02, tmin2, dev_min_index2);
+                        dXdY_limit <<<N/blockSize, blockSize>>>(dev_x, dev_y, dev_vx, dev_vy, tmin2, border);
+                        dist_impulses_hwh <<<1,1>>> (dev_x, dev_y, dev_vx, dev_vy, dev_min_index2);
+                    }
+                }
+
+                CUDA_CHECK_ERROR(cudaMemcpy(x, dev_x, dSIZE, cudaMemcpyDeviceToHost)); // выгружаем на хост
+                CUDA_CHECK_ERROR(cudaMemcpy(y, dev_y, dSIZE, cudaMemcpyDeviceToHost));
+                CUDA_CHECK_ERROR(cudaMemcpy(vx, dev_vx, dSIZE, cudaMemcpyDeviceToHost));
+                CUDA_CHECK_ERROR(cudaMemcpy(vy, dev_vy, dSIZE, cudaMemcpyDeviceToHost));
+
+                sumE1 = 0;
+                for (int i = 0; i < N; i++) { // расичтываем закон сохр энергии
+                    sumE1 += vx[i]*vx[i] + vy[i]*vy[i];
+                }
+                sumE1 = sumE1/2.;
+
+                if (abs(sumE0/sumE1 - 1.) > 0.1) { // если ошибка в целый процент, то сообщаем и вырубаем
+                    printf("\n!!! Ошибка в законе сохранения энергии !!!\n");
+                    break;
+                } else {
+                    //----------------------------------Сохранение текущего состояния системы----------------------------------//
+
+                    FILE* f21;
+                    f21 = fopen("x.txt", "w");
+                    for(int i = 0; i < N; i++) {
+                        fprintf(f21, "%.16f\n", x[i]);
+                    } fclose(f21);
+
+                    FILE* f22;
+                    f22 = fopen("y.txt", "w");
+                    for(int i = 0; i < N; i++) {
+                        fprintf(f22, "%.16f\n", y[i]);
+                    } fclose(f22);
+
+                    FILE* f23;
+                    f23 = fopen("vx.txt", "w");
+                    for(int i = 0; i < N; i++) {
+                        fprintf(f23, "%.16f\n", vx[i]);
+                    } fclose(f23);
+
+                    FILE* f24;
+                    f24 = fopen("vy.txt", "w");
+                    for(int i = 0; i < N; i++) {
+                        fprintf(f24, "%.16f\n", vy[i]);
+                    } fclose(f24);
+
+                    // Сохраним координаты и скорости каждой итерации
+                    f3 = fopen("log.csv", "a");
+                    for (int i = 0; i < N; i++) {
+                        fprintf(f3,"%.16f,%.16f,%.16f,%.16f,%.16f", x[i], y[i], vx[i], vy[i], search_V(vx[i], vy[i]));
+                        if (i == 0) {
+                            fprintf(f3,",%i,%.16f,%.6f", coll[j], system_time, t.elapsed()/60.);
+                        }
+                        fprintf(f3,"\n");
+                    } fclose(f3);
+                    printf("%i/%i готово, прошло %.5f min\n", j+1, iter, t.elapsed()/60.);
+                }
+            } break;
+        case 1: for (int j = 0; j < iter; j++) {
+                system_time = 0; // время эволюции системы
+
+                for (int i = 0; i < coll[j]; i++) {
+
+                    out[0] = DOUBLE_MAX;
+                    // periodic walls y axis (vertical)
+                    kernel_pwa <<<threads/blockSize, blockSize>>>(dev_x, dev_y, dev_vx, dev_vy, dev_m, dev_l, dev_tmin0, border, R);
+//      Отберем из массива наименьшее время
+                    CUDA_CHECK_ERROR(cudaMemcpy(dev_out, out, dSIZE, cudaMemcpyHostToDevice));
+                    cuda_minimum <<<blocks, blockSize>>>(dev_tmin0, threads, dev_out);
+                    CUDA_CHECK_ERROR(cudaMemcpy(out, dev_out, dSIZE, cudaMemcpyDeviceToHost));
+
+                    tmin = out[0];
+                    system_time += tmin; //прибавляем квант времени к общему времени эволюции системы
+                    search_min_index <<<blocks, blockSize>>> (dev_tmin0, tmin, dev_min_index);
+                    dXdY_limit <<<N/blockSize, blockSize>>>(dev_x, dev_y, dev_vx, dev_vy, tmin, border);
+                    dist_impulses_pwa <<<1,1>>> (dev_x, dev_y, dev_vx, dev_vy, dev_min_index, dev_m, dev_l, border, R);
+                }
+
+                CUDA_CHECK_ERROR(cudaMemcpy(x, dev_x, dSIZE, cudaMemcpyDeviceToHost)); // выгружаем на хост
+                CUDA_CHECK_ERROR(cudaMemcpy(y, dev_y, dSIZE, cudaMemcpyDeviceToHost));
+                CUDA_CHECK_ERROR(cudaMemcpy(vx, dev_vx, dSIZE, cudaMemcpyDeviceToHost));
+                CUDA_CHECK_ERROR(cudaMemcpy(vy, dev_vy, dSIZE, cudaMemcpyDeviceToHost));
+
+                sumE1 = 0;
+                for (int i = 0; i < N; i++) { // расичтываем закон сохр энергии
+                    sumE1 += vx[i]*vx[i] + vy[i]*vy[i];
+                }
+                sumE1 = sumE1/2.;
+
+                if (abs(sumE0/sumE1 - 1.) > 0.1) { // если ошибка в целый процент, то сообщаем и вырубаем
+                    printf("\n!!! Ошибка в законе сохранения энергии !!!\n");
+                    break;
+                } else {
+                    //----------------------------------Сохранение текущего состояния системы----------------------------------//
+
+                    FILE* f21;
+                    f21 = fopen("x.txt", "w");
+                    for(int i = 0; i < N; i++) {
+                        fprintf(f21, "%.16f\n", x[i]);
+                    } fclose(f21);
+
+                    FILE* f22;
+                    f22 = fopen("y.txt", "w");
+                    for(int i = 0; i < N; i++) {
+                        fprintf(f22, "%.16f\n", y[i]);
+                    } fclose(f22);
+
+                    FILE* f23;
+                    f23 = fopen("vx.txt", "w");
+                    for(int i = 0; i < N; i++) {
+                        fprintf(f23, "%.16f\n", vx[i]);
+                    } fclose(f23);
+
+                    FILE* f24;
+                    f24 = fopen("vy.txt", "w");
+                    for(int i = 0; i < N; i++) {
+                        fprintf(f24, "%.16f\n", vy[i]);
+                    } fclose(f24);
+
+                    // Сохраним координаты и скорости каждой итерации
+                    f3 = fopen("log.csv", "a");
+                    for (int i = 0; i < N; i++) {
+                        fprintf(f3,"%.16f,%.16f,%.16f,%.16f,%.16f", x[i], y[i], vx[i], vy[i], search_V(vx[i], vy[i]));
+                        if (i == 0) {
+                            fprintf(f3,",%i,%.16f,%.6f", coll[j], system_time, t.elapsed()/60.);
+                        }
+                        fprintf(f3,"\n");
+                    } fclose(f3);
+                    printf("%i/%i готово, прошло %.5f min\n", j+1, iter, t.elapsed()/60.);
+                }
+            } break;
+    }
+
+    printf("\nКонечная энергия: %.16f\n", sumE1);
+    //printf("Конечный импульс B_impulse: %.16f\n\n", sumI);
+    printf("Время исполнения программы (минут): %.5f\n", t.elapsed()/60.);
+    printf("Время эволюции системы: %.5f\n", system_time);
+
+    free(x);
+    free(y);
+    free(vx);
+    free(vy);
+    free(m);
+    free(l);
+
+    cudaFree(dev_x);
+    cudaFree(dev_y);
+    cudaFree(dev_vx);
+    cudaFree(dev_vy);
+    cudaFree(m);
+    cudaFree(l);
+
+    return 0;
+}
